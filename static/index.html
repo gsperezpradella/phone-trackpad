@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#111">
+<title>Phone Trackpad</title>
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;user-select:none;-webkit-user-select:none}
+  html,body{margin:0;height:100%;background:#111;color:#888;font:14px system-ui,sans-serif;overflow:hidden;overscroll-behavior:none}
+  body{display:flex;flex-direction:column;padding:env(safe-area-inset-top) 8px env(safe-area-inset-bottom)}
+  #bar{display:flex;justify-content:space-between;align-items:center;padding:8px 4px}
+  #dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#c33;margin-right:6px}
+  #dot.on{background:#3c6}
+  #pad{flex:1;background:#1c1c1e;border-radius:18px;touch-action:none;display:flex;align-items:center;justify-content:center;text-align:center;padding:24px;line-height:1.6}
+  #pad.active{background:#242428}
+  #btns{display:flex;gap:8px;height:84px;margin-top:8px}
+  #btns button{flex:1;border:0;border-radius:14px;background:#2a2a2d;color:#ccc;font-size:15px;touch-action:none}
+  #btns button:active,#btns button.down{background:#3a3a3f}
+  #btns #mid{flex:.5}
+  input{width:90px}
+</style>
+</head>
+<body>
+<div id="bar">
+  <span><span id="dot"></span><span id="st">conectando…</span></span>
+  <label>Velocidad <input id="sens" type="range" min="0.5" max="4" step="0.1" value="1.6"></label>
+</div>
+<div id="pad">1 dedo: mover · toque: clic<br>2 dedos: scroll · toque: clic derecho<br>3 dedos toque: clic medio<br>toque + mantener y arrastrar: arrastrar</div>
+<div id="btns"><button id="l">Izq</button><button id="mid">Med</button><button id="r">Der</button></div>
+<script>
+const key = new URLSearchParams(location.search).get('k') || '';
+const $ = id => document.getElementById(id);
+let ws, queue = [];
+function connect(){
+  ws = new WebSocket(`ws://${location.host}/ws?k=${encodeURIComponent(key)}`);
+  ws.onopen = () => { $('dot').className='on'; $('st').textContent='conectado'; };
+  ws.onclose = () => { $('dot').className=''; $('st').textContent='reconectando…'; setTimeout(connect,1000); };
+}
+connect();
+const send = m => { if (ws.readyState === 1) ws.send(JSON.stringify(m)); };
+
+// sensibilidad guardada
+const sens = $('sens');
+try { sens.value = localStorage.getItem('sens') || sens.value; } catch(e){}
+sens.oninput = () => { try{ localStorage.setItem('sens', sens.value); }catch(e){} };
+
+// acumula deltas y envía una vez por frame
+let mx=0,my=0,sx=0,sy=0;
+function flush(){
+  if (mx||my){ send({t:'move',dx:mx,dy:my}); mx=my=0; }
+  if (sx||sy){ send({t:'scroll',dx:sx,dy:sy}); sx=sy=0; }
+  requestAnimationFrame(flush);
+}
+requestAnimationFrame(flush);
+
+// aceleración suave: más velocidad del dedo => más recorrido
+const accel = d => { const a=Math.abs(d); return d*(1+Math.min(a/12,1.2)); };
+
+const pad = $('pad');
+let t0=0, maxTouches=0, moved=0, lastTapEnd=0, dragging=false, prev=null, scrollRemX=0, scrollRemY=0;
+const pts = e => [...e.touches].map(t=>({x:t.clientX,y:t.clientY}));
+const center = p => ({x:p.reduce((s,q)=>s+q.x,0)/p.length, y:p.reduce((s,q)=>s+q.y,0)/p.length});
+
+pad.addEventListener('touchstart', e=>{
+  e.preventDefault();
+  pad.classList.add('active');
+  const p = pts(e);
+  if (e.touches.length === 1){
+    t0 = performance.now(); maxTouches = 1; moved = 0;
+    if (t0 - lastTapEnd < 300){ dragging = true; send({t:'down',b:'left'}); }
+  } else maxTouches = Math.max(maxTouches, e.touches.length);
+  prev = center(p);
+},{passive:false});
+
+pad.addEventListener('touchmove', e=>{
+  e.preventDefault();
+  const c = center(pts(e));
+  if (!prev){ prev = c; return; }
+  const dx = c.x-prev.x, dy = c.y-prev.y;
+  prev = c;
+  moved += Math.abs(dx)+Math.abs(dy);
+  const k = parseFloat(sens.value);
+  if (e.touches.length === 1){ mx += accel(dx)*k; my += accel(dy)*k; }
+  else if (e.touches.length === 2){
+    // scroll natural (el contenido sigue al dedo); ~ 1 línea cada 12px
+    scrollRemX += dx/12; scrollRemY += -dy/12;
+    const ix = Math.trunc(scrollRemX), iy = Math.trunc(scrollRemY);
+    sx += ix; sy += iy; scrollRemX -= ix; scrollRemY -= iy;
+  }
+},{passive:false});
+
+pad.addEventListener('touchend', e=>{
+  e.preventDefault();
+  if (e.touches.length > 0){ prev = center(pts(e)); return; }
+  pad.classList.remove('active');
+  const dur = performance.now()-t0, isTap = dur<250 && moved<10;
+  if (dragging){
+    send({t:'up',b:'left'}); dragging=false; lastTapEnd=0;
+    if (isTap) send({t:'click',b:'left'}); // doble clic si fue toque-toque
+  } else if (isTap){
+    const b = maxTouches===1 ? 'left' : maxTouches===2 ? 'right' : 'middle';
+    send({t:'click',b});
+    if (maxTouches===1) lastTapEnd = performance.now();
+  }
+  prev = null; scrollRemX = scrollRemY = 0;
+},{passive:false});
+pad.addEventListener('touchcancel', ()=>{ if(dragging){send({t:'up',b:'left'});dragging=false;} prev=null; });
+
+// botones físicos en pantalla (mantener = arrastrar)
+for (const [id,b] of [['l','left'],['mid','middle'],['r','right']]){
+  const el = $(id);
+  el.addEventListener('touchstart', e=>{ e.preventDefault(); el.classList.add('down'); send({t:'down',b}); },{passive:false});
+  const up = e=>{ e.preventDefault(); el.classList.remove('down'); send({t:'up',b}); };
+  el.addEventListener('touchend', up,{passive:false});
+  el.addEventListener('touchcancel', up,{passive:false});
+}
+document.addEventListener('contextmenu', e=>e.preventDefault());
+</script>
+</body>
+</html>
